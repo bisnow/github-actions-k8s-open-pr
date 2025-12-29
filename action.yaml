@@ -1,0 +1,179 @@
+name: 'Deploy PR Stack with Helm'
+description: 'Deploys a Laravel PR stack to Kubernetes using Helm'
+
+inputs:
+  pr-number:
+    description: 'Pull request number'
+    required: true
+  image-tag:
+    description: 'Docker image tag to deploy'
+    required: true
+  app-name:
+    description: 'Application name (e.g., leads-test, dashboard)'
+    required: true
+  cloudformation-stack-name:
+    description: 'CloudFormation stack name to query for IAM role ARN'
+    required: true
+  aws-account:
+    description: 'AWS account name'
+    required: false
+    default: 'bisnow'
+  eks-cluster:
+    description: 'EKS cluster name'
+    required: false
+    default: 'bisnow-non-prod-eks'
+  namespace:
+    description: 'Kubernetes namespace'
+    required: false
+    default: 'biscred-pr-stacks'
+  helm-chart-version:
+    description: 'Helm chart version'
+    required: false
+    default: '1.1.0'
+  values-file-path:
+    description: 'Path to Helm values file'
+    required: false
+    default: '.k8s/overlays/pr/values.yaml'
+  ecr-registry:
+    description: 'ECR registry URL'
+    required: false
+    default: '560285300220.dkr.ecr.us-east-1.amazonaws.com'
+
+outputs:
+  app-url:
+    description: 'The deployed application URL'
+    value: ${{ steps.get-url.outputs.app-url }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v5
+
+    - name: Assume role for AWS Account
+      uses: bisnow/github-actions-assume-role-for-environment@main
+      with:
+        aws-account: ${{ inputs.aws-account }}
+
+    - name: Configure kubectl
+      shell: bash
+      run: |
+        aws eks update-kubeconfig --region us-east-1 --name ${{ inputs.eks-cluster }}
+
+    - name: Authenticate Helm with ECR
+      shell: bash
+      run: |
+        # Get ECR login token and configure Helm to use it
+        aws ecr get-login-password --region us-east-1 | \
+          helm registry login ${{ inputs.ecr-registry }} \
+          --username AWS \
+          --password-stdin
+
+    - name: Get IAM Role ARN from CloudFormation
+      id: get-role-arn
+      shell: bash
+      run: |
+        echo "Querying CloudFormation stack for IAM role ARN..."
+        STACK_NAME="${{ inputs.cloudformation-stack-name }}"
+
+        ROLE_ARN=$(aws cloudformation describe-stacks \
+          --stack-name "${STACK_NAME}" \
+          --query 'Stacks[0].Outputs[?OutputKey==`LeadsRoleArn`].OutputValue' \
+          --output text)
+
+        if [ -z "$ROLE_ARN" ]; then
+          echo "ERROR: Could not find LeadsRoleArn output in CloudFormation stack ${STACK_NAME}"
+          echo "Make sure the CloudFormation stack has been deployed successfully."
+          exit 1
+        fi
+
+        echo "role-arn=${ROLE_ARN}" >> $GITHUB_OUTPUT
+        echo "Found IAM Role ARN: ${ROLE_ARN}"
+
+    - name: Deploy PR Stack
+      shell: bash
+      run: |
+        echo "Deploying PR #${{ inputs.pr-number }} with image ${{ inputs.image-tag }}"
+
+        helm upgrade --install pr-${{ inputs.pr-number }} \
+          oci://${{ inputs.ecr-registry }}/laravel-pr-stack \
+          --version ${{ inputs.helm-chart-version }} \
+          --namespace ${{ inputs.namespace }} \
+          --values ${{ inputs.values-file-path }} \
+          --set global.prNumber=${{ inputs.pr-number }} \
+          --set image.tag=${{ inputs.image-tag }} \
+          --set serviceAccount.roleArn="${{ steps.get-role-arn.outputs.role-arn }}" \
+          --wait \
+          --timeout 10m
+
+    - name: Get Deployed URL
+      id: get-url
+      shell: bash
+      run: |
+        echo "Querying deployed ingress for actual URL..."
+        INGRESS_HOST=$(kubectl get ingress -n ${{ inputs.namespace }} \
+          -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }} \
+          -o jsonpath='{.items[0].spec.rules[0].host}')
+
+        if [ -z "$INGRESS_HOST" ]; then
+          echo "ERROR: Could not find ingress for app=${{ inputs.app-name }} PR #${{ inputs.pr-number }}"
+          echo "This usually means the ingress was not created by Helm."
+          exit 1
+        fi
+
+        APP_URL="https://${INGRESS_HOST}"
+        echo "app-url=${APP_URL}" >> $GITHUB_OUTPUT
+        echo "Deployed URL: ${APP_URL}"
+
+    - name: Verify Deployment
+      shell: bash
+      run: |
+        echo "Checking pod status..."
+        kubectl get pod -n ${{ inputs.namespace }} -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }}
+
+        echo "Waiting for pod to be ready..."
+        kubectl wait --for=condition=ready pod \
+          -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }} \
+          -n ${{ inputs.namespace }} \
+          --timeout=300s
+
+    - name: Test Connections
+      shell: bash
+      run: |
+        POD=$(kubectl get pod -n ${{ inputs.namespace }} -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }} -o jsonpath='{.items[0].metadata.name}')
+
+        echo "Testing database connection..."
+        kubectl exec -n ${{ inputs.namespace }} ${POD} -c web -- php artisan tinker --execute="
+        try {
+            DB::connection()->getPdo();
+            echo 'DB: ✓ Connected\n';
+        } catch (Exception \$e) {
+            echo 'DB: ✗ ' . \$e->getMessage() . '\n';
+            exit(1);
+        }
+        "
+
+        echo "Testing Redis connection..."
+        kubectl exec -n ${{ inputs.namespace }} ${POD} -c web -- php artisan tinker --execute="
+        try {
+            Cache::put('test', 'ok', 5);
+            echo Cache::get('test') === 'ok' ? 'Redis: ✓ Connected\n' : 'Redis: ✗ Failed\n';
+        } catch (Exception \$e) {
+            echo 'Redis: ✗ ' . \$e->getMessage() . '\n';
+            exit(1);
+        }
+        "
+
+
+    - name: Output Summary
+      shell: bash
+      run: |
+        echo "## PR Environment Deployed!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**URL:** ${{ steps.get-url.outputs.app-url }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Image:** \`${{ inputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Status" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        kubectl get pod -n ${{ inputs.namespace }} -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }} >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
