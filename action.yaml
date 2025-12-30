@@ -24,8 +24,7 @@ inputs:
     default: 'bisnow-non-prod-eks'
   namespace:
     description: 'Kubernetes namespace'
-    required: false
-    default: 'biscred-pr-stacks'
+    required: true
   helm-chart-version:
     description: 'Helm chart version'
     required: false
@@ -33,7 +32,7 @@ inputs:
   values-file-path:
     description: 'Path to Helm values file'
     required: false
-    default: '.k8s/overlays/pr/values.yaml'
+    default: '.k8s/pr/values.yaml'
   ecr-registry:
     description: 'ECR registry URL'
     required: false
