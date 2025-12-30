@@ -9,7 +9,7 @@ inputs:
     description: 'Docker image tag to deploy'
     required: true
   app-name:
-    description: 'Application name (e.g., leads-test, dashboard)'
+    description: 'Application name (e.g., leads, dashboard)'
     required: true
   cloudformation-stack-name:
     description: 'CloudFormation stack name to query for IAM role ARN'
@@ -77,12 +77,12 @@ runs:
 
         ROLE_ARN=$(aws cloudformation describe-stacks \
           --stack-name "${STACK_NAME}" \
-          --query 'Stacks[0].Outputs[?OutputKey==`LeadsRoleArn`].OutputValue' \
-          --output text)
+          --query 'Stacks[0].Outputs[?contains(OutputKey, `RoleArn`)].OutputValue' \
+          --output text | head -n 1)
 
         if [ -z "$ROLE_ARN" ]; then
-          echo "ERROR: Could not find LeadsRoleArn output in CloudFormation stack ${STACK_NAME}"
-          echo "Make sure the CloudFormation stack has been deployed successfully."
+          echo "ERROR: Could not find any output containing 'RoleArn' in CloudFormation stack ${STACK_NAME}"
+          echo "Make sure the CloudFormation stack has an output with 'RoleArn' in the key name."
           exit 1
         fi
 
