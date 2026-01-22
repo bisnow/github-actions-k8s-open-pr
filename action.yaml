@@ -37,6 +37,10 @@ inputs:
     description: 'ECR registry URL'
     required: false
     default: '560285300220.dkr.ecr.us-east-1.amazonaws.com'
+  kustomization-path:
+    description: 'Path to kustomization directory containing sealed secrets'
+    required: false
+    default: '.k8s/pr'
 
 outputs:
   app-url:
@@ -88,6 +92,21 @@ runs:
 
         echo "role-arn=${ROLE_ARN}" >> $GITHUB_OUTPUT
         echo "Found IAM Role ARN: ${ROLE_ARN}"
+
+    - name: Apply Sealed Secrets
+      shell: bash
+      run: |
+        KUSTOMIZATION_PATH="${{ inputs.kustomization-path }}"
+
+        if [ -f "${KUSTOMIZATION_PATH}/kustomization.yaml" ]; then
+          echo "Applying sealed secrets from ${KUSTOMIZATION_PATH}..."
+          kubectl apply -k "${KUSTOMIZATION_PATH}"
+
+          echo "Waiting for sealed-secrets controller to decrypt..."
+          sleep 10
+        else
+          echo "No kustomization.yaml found at ${KUSTOMIZATION_PATH}, skipping sealed secrets..."
+        fi
 
     - name: Deploy PR Stack
       shell: bash
