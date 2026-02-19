@@ -28,7 +28,7 @@ inputs:
   helm-chart-version:
     description: 'Helm chart version'
     required: false
-    default: '1.2.0'
+    default: '1.3.1'
   values-file-path:
     description: 'Path to Helm values file'
     required: false
@@ -128,7 +128,7 @@ runs:
         echo "Deploying PR #${{ inputs.pr-number }} with image ${{ inputs.image-tag }}"
 
         # Build helm command with standard arguments
-        HELM_CMD="helm upgrade --install pr-${{ inputs.pr-number }} \
+        HELM_CMD="helm upgrade --install pr-${{ inputs.pr-number }}-${{ inputs.app-name }} \
           oci://${{ inputs.ecr-registry }}/laravel-pr-stack \
           --version ${{ inputs.helm-chart-version }} \
           --namespace ${{ inputs.namespace }} \
