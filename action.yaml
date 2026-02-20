@@ -143,7 +143,8 @@ runs:
           HELM_CMD="$HELM_CMD \
             --set appConfig.data.DB_HOST=${{ inputs.external-database-host }} \
             --set appConfig.data.DB_READ_HOST=${{ inputs.external-database-host }} \
-            --set appConfig.data.DB_WRITE_HOST=${{ inputs.external-database-host }}"
+            --set appConfig.data.DB_WRITE_HOST=${{ inputs.external-database-host }} \
+            --set additionalContainersDbHost=${{ inputs.external-database-host }}"
         fi
 
         # Add wait and timeout
