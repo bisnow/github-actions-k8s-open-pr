@@ -151,7 +151,7 @@ runs:
         HELM_CMD="$HELM_CMD --wait --timeout 10m"
 
         # Execute
-        eval $HELM_CMD
+        eval "$HELM_CMD"
 
     - name: Get Deployed URL
       id: get-url
@@ -211,7 +211,8 @@ runs:
         kubectl exec -n ${{ inputs.namespace }} ${POD} -c web -- php artisan tinker --execute="
         try {
             Cache::put('test', 'ok', 5);
-            echo Cache::get('test') === 'ok' ? 'Redis: Connected\n' : 'Redis: Failed\n';
+            if (Cache::get('test') !== 'ok') { echo 'Redis: Failed\n'; exit(1); }
+            echo 'Redis: Connected\n';
         } catch (Exception \$e) {
             echo 'Redis: ' . \$e->getMessage() . '\n';
             exit(1);
