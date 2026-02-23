@@ -127,8 +127,19 @@ runs:
       run: |
         echo "Deploying PR #${{ inputs.pr-number }} with image ${{ inputs.image-tag }}"
 
+        RELEASE_PREFIX="pr-${{ inputs.pr-number }}-"
+        MAX_APP_LEN=$((53 - ${#RELEASE_PREFIX}))
+        APP_NAME="${{ inputs.app-name }}"
+
+        if [ ${#APP_NAME} -gt $MAX_APP_LEN ]; then
+          APP_NAME="${APP_NAME:0:$MAX_APP_LEN}"
+          echo "Warning: app-name truncated to ${MAX_APP_LEN} chars to fit Helm 53-char release name limit: ${APP_NAME}"
+        fi
+
+        RELEASE_NAME="${RELEASE_PREFIX}${APP_NAME}"
+
         # Build helm command with standard arguments
-        HELM_CMD="helm upgrade --install pr-${{ inputs.pr-number }}-${{ inputs.app-name }} \
+        HELM_CMD="helm upgrade --install ${RELEASE_NAME} \
           oci://${{ inputs.ecr-registry }}/laravel-pr-stack \
           --version ${{ inputs.helm-chart-version }} \
           --namespace ${{ inputs.namespace }} \
