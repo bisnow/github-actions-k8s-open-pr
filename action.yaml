@@ -28,7 +28,7 @@ inputs:
   helm-chart-version:
     description: 'Helm chart version'
     required: false
-    default: '1.1.0'
+    default: '1.3.1'
   values-file-path:
     description: 'Path to Helm values file'
     required: false
@@ -41,6 +41,20 @@ inputs:
     description: 'Path to kustomization directory containing sealed secrets'
     required: false
     default: '.k8s/pr'
+  # External database configuration
+  external-database-host:
+    description: 'External database host (e.g., pr-123-mysql.biscred-db.svc.cluster.local). If set, DB_HOST values will be configured.'
+    required: false
+    default: ''
+  # Connection test configuration
+  skip-connection-tests:
+    description: 'Skip database and Redis connection tests'
+    required: false
+    default: 'false'
+  skip-redis-test:
+    description: 'Skip Redis connection test (for apps using file-based cache)'
+    required: false
+    default: 'false'
 
 outputs:
   app-url:
@@ -113,16 +127,42 @@ runs:
       run: |
         echo "Deploying PR #${{ inputs.pr-number }} with image ${{ inputs.image-tag }}"
 
-        helm upgrade --install pr-${{ inputs.pr-number }} \
+        RELEASE_PREFIX="pr-${{ inputs.pr-number }}-"
+        MAX_APP_LEN=$((53 - ${#RELEASE_PREFIX}))
+        APP_NAME="${{ inputs.app-name }}"
+
+        if [ ${#APP_NAME} -gt $MAX_APP_LEN ]; then
+          APP_NAME="${APP_NAME:0:$MAX_APP_LEN}"
+          echo "Warning: app-name truncated to ${MAX_APP_LEN} chars to fit Helm 53-char release name limit: ${APP_NAME}"
+        fi
+
+        RELEASE_NAME="${RELEASE_PREFIX}${APP_NAME}"
+
+        # Build helm command with standard arguments
+        HELM_CMD="helm upgrade --install ${RELEASE_NAME} \
           oci://${{ inputs.ecr-registry }}/laravel-pr-stack \
           --version ${{ inputs.helm-chart-version }} \
           --namespace ${{ inputs.namespace }} \
           --values ${{ inputs.values-file-path }} \
           --set global.prNumber=${{ inputs.pr-number }} \
           --set image.tag=${{ inputs.image-tag }} \
-          --set serviceAccount.roleArn="${{ steps.get-role-arn.outputs.role-arn }}" \
-          --wait \
-          --timeout 10m
+          --set serviceAccount.roleArn=${{ steps.get-role-arn.outputs.role-arn }}"
+
+        # Add external database host configuration if provided
+        if [ -n "${{ inputs.external-database-host }}" ]; then
+          echo "External database enabled, host: ${{ inputs.external-database-host }}"
+          HELM_CMD="$HELM_CMD \
+            --set appConfig.data.DB_HOST=${{ inputs.external-database-host }} \
+            --set appConfig.data.DB_READ_HOST=${{ inputs.external-database-host }} \
+            --set appConfig.data.DB_WRITE_HOST=${{ inputs.external-database-host }} \
+            --set additionalContainersDbHost=${{ inputs.external-database-host }}"
+        fi
+
+        # Add wait and timeout
+        HELM_CMD="$HELM_CMD --wait --timeout 10m"
+
+        # Execute
+        eval "$HELM_CMD"
 
     - name: Get Deployed URL
       id: get-url
@@ -155,7 +195,8 @@ runs:
           -n ${{ inputs.namespace }} \
           --timeout=300s
 
-    - name: Test Connections
+    - name: Test Database Connection
+      if: inputs.skip-connection-tests != 'true'
       shell: bash
       run: |
         POD=$(kubectl get pod -n ${{ inputs.namespace }} -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }} -o jsonpath='{.items[0].metadata.name}')
@@ -164,24 +205,30 @@ runs:
         kubectl exec -n ${{ inputs.namespace }} ${POD} -c web -- php artisan tinker --execute="
         try {
             DB::connection()->getPdo();
-            echo 'DB: ✓ Connected\n';
+            echo 'DB: Connected\n';
         } catch (Exception \$e) {
-            echo 'DB: ✗ ' . \$e->getMessage() . '\n';
+            echo 'DB: ' . \$e->getMessage() . '\n';
             exit(1);
         }
         "
+
+    - name: Test Redis Connection
+      if: inputs.skip-connection-tests != 'true' && inputs.skip-redis-test != 'true'
+      shell: bash
+      run: |
+        POD=$(kubectl get pod -n ${{ inputs.namespace }} -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }} -o jsonpath='{.items[0].metadata.name}')
 
         echo "Testing Redis connection..."
         kubectl exec -n ${{ inputs.namespace }} ${POD} -c web -- php artisan tinker --execute="
         try {
             Cache::put('test', 'ok', 5);
-            echo Cache::get('test') === 'ok' ? 'Redis: ✓ Connected\n' : 'Redis: ✗ Failed\n';
+            if (Cache::get('test') !== 'ok') { echo 'Redis: Failed\n'; exit(1); }
+            echo 'Redis: Connected\n';
         } catch (Exception \$e) {
-            echo 'Redis: ✗ ' . \$e->getMessage() . '\n';
+            echo 'Redis: ' . \$e->getMessage() . '\n';
             exit(1);
         }
         "
-
 
     - name: Output Summary
       shell: bash
@@ -190,6 +237,9 @@ runs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "**URL:** ${{ steps.get-url.outputs.app-url }}" >> $GITHUB_STEP_SUMMARY
         echo "**Image:** \`${{ inputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+        if [ -n "${{ inputs.external-database-host }}" ]; then
+          echo "**Database:** \`${{ inputs.external-database-host }}\`" >> $GITHUB_STEP_SUMMARY
+        fi
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "### Status" >> $GITHUB_STEP_SUMMARY
         echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
