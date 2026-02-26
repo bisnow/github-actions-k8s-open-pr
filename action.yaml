@@ -67,6 +67,8 @@ runs:
   steps:
     - name: Checkout Repository
       uses: actions/checkout@v5
+      with:
+        ref: ${{ github.head_ref || github.ref_name }}
 
     - name: Assume role for AWS Account
       uses: bisnow/github-actions-assume-role-for-environment@main
