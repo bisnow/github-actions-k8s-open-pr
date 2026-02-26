@@ -6,8 +6,9 @@ inputs:
     description: 'Pull request number'
     required: true
   image-tag:
-    description: 'Docker image tag to deploy'
-    required: true
+    description: 'Docker image tag to deploy. If omitted, uses the tag already set in the values file.'
+    required: false
+    default: ''
   app-name:
     description: 'Application name (e.g., leads, dashboard)'
     required: true
@@ -145,8 +146,11 @@ runs:
           --namespace ${{ inputs.namespace }} \
           --values ${{ inputs.values-file-path }} \
           --set global.prNumber=${{ inputs.pr-number }} \
-          --set image.tag=${{ inputs.image-tag }} \
           --set serviceAccount.roleArn=${{ steps.get-role-arn.outputs.role-arn }}"
+
+        if [ -n "${{ inputs.image-tag }}" ]; then
+          HELM_CMD="$HELM_CMD --set image.tag=${{ inputs.image-tag }}"
+        fi
 
         # Add external database host configuration if provided
         if [ -n "${{ inputs.external-database-host }}" ]; then
@@ -236,7 +240,11 @@ runs:
         echo "## PR Environment Deployed!" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "**URL:** ${{ steps.get-url.outputs.app-url }}" >> $GITHUB_STEP_SUMMARY
-        echo "**Image:** \`${{ inputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+        IMAGE_TAG="${{ inputs.image-tag }}"
+        if [ -z "$IMAGE_TAG" ]; then
+          IMAGE_TAG=$(yq '.image.tag' ${{ inputs.values-file-path }})
+        fi
+        echo "**Image:** \`${IMAGE_TAG}\`" >> $GITHUB_STEP_SUMMARY
         if [ -n "${{ inputs.external-database-host }}" ]; then
           echo "**Database:** \`${{ inputs.external-database-host }}\`" >> $GITHUB_STEP_SUMMARY
         fi
