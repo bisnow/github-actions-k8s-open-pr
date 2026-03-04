@@ -29,7 +29,7 @@ inputs:
   helm-chart-version:
     description: 'Helm chart version'
     required: false
-    default: '1.3.1'
+    default: '1'
   values-file-path:
     description: 'Path to Helm values file'
     required: false
@@ -42,6 +42,11 @@ inputs:
     description: 'Path to kustomization directory containing sealed secrets'
     required: false
     default: '.k8s/pr'
+  # Extra Helm --set overrides (space-separated, e.g. "externalDatabase.enabled=true mysql.enabled=false")
+  helm-set-values:
+    description: 'Additional Helm --set overrides to apply at deploy time (space-separated key=value pairs).'
+    required: false
+    default: ''
   # External database configuration
   external-database-host:
     description: 'External database host (e.g., pr-123-mysql.biscred-db.svc.cluster.local). If set, DB_HOST values will be configured.'
@@ -152,6 +157,13 @@ runs:
 
         if [ -n "${{ inputs.image-tag }}" ]; then
           HELM_CMD="$HELM_CMD --set image.tag=${{ inputs.image-tag }}"
+        fi
+
+        # Add any extra --set overrides
+        if [ -n "${{ inputs.helm-set-values }}" ]; then
+          for kv in ${{ inputs.helm-set-values }}; do
+            HELM_CMD="$HELM_CMD --set $kv"
+          done
         fi
 
         # Add external database host configuration if provided
