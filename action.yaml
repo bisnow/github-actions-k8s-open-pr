@@ -186,19 +186,41 @@ runs:
       id: get-url
       shell: bash
       run: |
-        echo "Querying deployed ingress for actual URL..."
+        echo "Querying deployed resources for URL..."
+        INGRESS_HOST=""
+
+        # 1. Try standard Kubernetes Ingress (chart v1 / ALB)
         INGRESS_HOST=$(kubectl get ingress -n ${{ inputs.namespace }} \
           -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }} \
-          -o jsonpath='{.items[0].spec.rules[0].host}')
+          -o jsonpath='{.items[0].spec.rules[0].host}' 2>/dev/null || true)
 
+        # 2. Try Traefik IngressRoute CRD (chart v2)
         if [ -z "$INGRESS_HOST" ]; then
-          echo "ERROR: Could not find ingress for app=${{ inputs.app-name }} PR #${{ inputs.pr-number }}"
-          echo "This usually means the ingress was not created by Helm."
-          exit 1
+          echo "No standard Ingress found, checking Traefik IngressRoute..."
+          INGRESSROUTE_MATCH=$(kubectl get ingressroute -n ${{ inputs.namespace }} \
+            -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }} \
+            -o jsonpath='{.items[0].spec.routes[0].match}' 2>/dev/null || true)
+
+          if [ -n "$INGRESSROUTE_MATCH" ]; then
+            # Extract hostname from e.g. Host(`bridge-pr-71.non-prod.bisnow.cloud`)
+            INGRESS_HOST=$(echo "$INGRESSROUTE_MATCH" | sed "s/[^\`]*\`\([^\`]*\)\`.*/\1/")
+            echo "Found IngressRoute host: ${INGRESS_HOST}"
+          fi
+        fi
+
+        # 3. Fall back to constructed URL based on naming convention
+        URL_ESTIMATED=false
+        if [ -z "$INGRESS_HOST" ]; then
+          echo "WARNING: Could not find Ingress or IngressRoute for app=${{ inputs.app-name }} PR #${{ inputs.pr-number }}"
+          echo "Falling back to estimated URL based on naming convention."
+          INGRESS_HOST="${{ inputs.app-name }}-pr-${{ inputs.pr-number }}.non-prod.bisnow.cloud"
+          echo "Estimated URL (may not reflect actual routing): https://${INGRESS_HOST}"
+          URL_ESTIMATED=true
         fi
 
         APP_URL="https://${INGRESS_HOST}"
         echo "app-url=${APP_URL}" >> $GITHUB_OUTPUT
+        echo "url-estimated=${URL_ESTIMATED}" >> $GITHUB_OUTPUT
         echo "Deployed URL: ${APP_URL}"
 
     - name: Verify Deployment
@@ -253,6 +275,11 @@ runs:
       run: |
         echo "## PR Environment Deployed!" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ steps.get-url.outputs.url-estimated }}" = "true" ]; then
+          echo "> [!WARNING]" >> $GITHUB_STEP_SUMMARY
+          echo "> Could not find an Ingress or IngressRoute for **${{ inputs.app-name }}** PR #${{ inputs.pr-number }}. The URL below is estimated from the naming convention and may not be correct." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+        fi
         echo "**URL:** ${{ steps.get-url.outputs.app-url }}" >> $GITHUB_STEP_SUMMARY
         IMAGE_TAG="${{ inputs.image-tag }}"
         if [ -z "$IMAGE_TAG" ]; then

@@ -61,7 +61,10 @@ This action requires:
 3. Authenticates Helm with ECR
 4. Retrieves IAM role ARN from CloudFormation stack
 5. Deploys application using Helm with specified values
-6. Queries ingress for deployed URL
+6. Resolves the deployed URL using a three-tier lookup:
+   - **Standard Ingress** (chart v1 / ALB)
+   - **Traefik `IngressRoute` CRD** (chart v2) — extracts the hostname from the `Host(...)` match rule
+   - **Estimated URL** — falls back to `{app-name}-pr-{pr-number}.non-prod.bisnow.cloud` if neither resource is found, and emits a warning in the job summary
 7. Verifies pods are ready
 8. Tests database and Redis connections
 9. Outputs deployment summary to GitHub Actions
