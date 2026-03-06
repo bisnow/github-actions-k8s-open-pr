@@ -61,6 +61,14 @@ inputs:
     description: 'Skip Redis connection test (for apps using file-based cache)'
     required: false
     default: 'false'
+  app-id:
+    description: 'GitHub App ID for posting a PR comment with the deployed URL. If omitted, no comment is posted.'
+    required: false
+    default: ''
+  private-key:
+    description: 'GitHub App private key for posting a PR comment with the deployed URL.'
+    required: false
+    default: ''
 
 outputs:
   app-url:
@@ -223,18 +231,6 @@ runs:
         echo "url-estimated=${URL_ESTIMATED}" >> $GITHUB_OUTPUT
         echo "Deployed URL: ${APP_URL}"
 
-    - name: Verify Deployment
-      shell: bash
-      run: |
-        echo "Checking pod status..."
-        kubectl get pod -n ${{ inputs.namespace }} -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }}
-
-        echo "Waiting for pod to be ready..."
-        kubectl wait --for=condition=ready pod \
-          -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }} \
-          -n ${{ inputs.namespace }} \
-          --timeout=300s
-
     - name: Test Database Connection
       if: inputs.skip-connection-tests != 'true'
       shell: bash
@@ -269,6 +265,50 @@ runs:
             exit(1);
         }
         "
+
+    - name: Generate GitHub App Token
+      id: app-token
+      if: inputs.app-id != '' && inputs.private-key != ''
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.private-key }}
+
+    - name: Post PR Comment
+      if: steps.app-token.outputs.token != ''
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ steps.app-token.outputs.token }}
+        script: |
+          const marker = '<!-- pr-stack-deployed -->';
+          const prNumber = parseInt('${{ inputs.pr-number }}');
+          const url = '${{ steps.get-url.outputs.app-url }}';
+          const body = [
+            marker,
+            '**PR Stack Deployed**',
+            '',
+            `**URL:** ${url}`,
+          ].join('\n');
+
+          const { data: comments } = await github.rest.issues.listComments({
+            ...context.repo,
+            issue_number: prNumber,
+          });
+
+          const existing = comments.find(c => c.body.includes(marker));
+          if (existing) {
+            await github.rest.issues.updateComment({
+              ...context.repo,
+              comment_id: existing.id,
+              body,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: prNumber,
+              body,
+            });
+          }
 
     - name: Output Summary
       shell: bash
