@@ -84,7 +84,7 @@ runs:
         ref: ${{ github.head_ref || github.ref_name }}
 
     - name: Assume role for AWS Account
-      uses: bisnow/github-actions-assume-role-for-environment@main
+      uses: bisnow/github-actions-assume-role-for-environment@update/change-aws-actions-versions
       with:
         aws-account: ${{ inputs.aws-account }}
 
