@@ -290,24 +290,32 @@ runs:
             `**URL:** ${url}`,
           ].join('\n');
 
+          console.log(`Posting comment to repo: ${JSON.stringify(context.repo)}, PR #${prNumber}`);
+
           const { data: comments } = await github.rest.issues.listComments({
             ...context.repo,
             issue_number: prNumber,
           });
 
+          console.log(`Found ${comments.length} existing comments`);
+
           const existing = comments.find(c => c.body.includes(marker));
           if (existing) {
+            console.log(`Updating existing comment ${existing.id}`);
             await github.rest.issues.updateComment({
               ...context.repo,
               comment_id: existing.id,
               body,
             });
+            console.log('Comment updated');
           } else {
+            console.log('Creating new comment');
             await github.rest.issues.createComment({
               ...context.repo,
               issue_number: prNumber,
               body,
             });
+            console.log('Comment created');
           }
 
     - name: Output Summary
