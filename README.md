@@ -38,6 +38,8 @@ Deploys Laravel PR stacks to Kubernetes using Helm. Handles AWS authentication, 
 | `helm-chart-version` | Helm chart version | No | `1.1.0` |
 | `values-file-path` | Helm values file path | No | `.k8s/overlays/pr/values.yaml` |
 | `ecr-registry` | ECR registry URL | No | `560285300220.dkr.ecr.us-east-1.amazonaws.com` |
+| `atomic` | Deploy with `helm --atomic --cleanup-on-fail`. See [Deploy reliability](#deploy-reliability) below. | No | `'true'` |
+| `sealed-secrets-timeout` | Seconds to wait for the sealed-secrets controller to materialize each target Secret. | No | `'60'` |
 
 ## Outputs
 
@@ -60,14 +62,73 @@ This action requires:
 2. Configures kubectl for EKS cluster
 3. Authenticates Helm with ECR
 4. Retrieves IAM role ARN from CloudFormation stack
-5. Deploys application using Helm with specified values
-6. Resolves the deployed URL using a three-tier lookup:
+5. Applies sealed secrets and waits for the sealed-secrets controller to materialize the
+   target `Secret`s (bounded by `sealed-secrets-timeout`)
+6. Runs preflight recovery to unstick a previously wedged Helm release (see
+   [Deploy reliability](#deploy-reliability))
+7. Deploys application using Helm with `--atomic --cleanup-on-fail` (unless `atomic: 'false'`),
+   dumping describe/events/logs on failure before exiting
+8. Resolves the deployed URL using a three-tier lookup:
    - **Standard Ingress** (chart v1 / ALB)
    - **Traefik `IngressRoute` CRD** (chart v2) — extracts the hostname from the `Host(...)` match rule
    - **Estimated URL** — falls back to `{app-name}-pr-{pr-number}.non-prod.bisnow.cloud` if neither resource is found, and emits a warning in the job summary
-7. Verifies pods are ready
-8. Tests database and Redis connections
-9. Outputs deployment summary to GitHub Actions
+9. Tests database and Redis connections
+10. Outputs deployment summary to GitHub Actions
+
+## Deploy reliability
+
+The action includes three reliability behaviors to keep a stuck or broken deploy from
+wedging the Helm release for subsequent CI runs.
+
+### 1. Preflight recovery
+
+Before each deploy, the action runs `helm status <release>` and checks for a pending
+state (`pending-upgrade`, `pending-install`, `pending-rollback`) — the state Helm is left
+in when a previous `helm upgrade --wait` is interrupted (timeout, cancelled workflow,
+runner killed). If a pending state is detected:
+
+- If a prior `deployed` revision exists, the action runs `helm rollback` to that
+  revision.
+- Otherwise (first-time install that never succeeded), it deletes the pending-state
+  release secrets (`-l owner=helm,name=<release>,status=pending-*`) so the next
+  `helm upgrade --install` can proceed.
+
+This step is idempotent and never fails the workflow on its own — if recovery doesn't
+work, the real deploy step still runs and surfaces the underlying error.
+
+### 2. Atomic deploys (default)
+
+With `atomic: 'true'` (default), the action passes `--atomic --cleanup-on-fail` to
+`helm upgrade --install`. A failed deploy is automatically rolled back and does **not**
+leave the release in a `pending-upgrade` state.
+
+**Tradeoff:** atomic rollback also removes the broken pods, so you lose the in-cluster
+state useful for post-mortem `kubectl describe` / `kubectl logs` against a live pod.
+The failure-diagnostics step (below) captures describe/events/logs **before** the
+rollback runs, so you still get the key signals in the workflow output. If you need the
+broken pods to stick around for live `kubectl` inspection, set `atomic: 'false'` for
+that run.
+
+### 3. Failure diagnostics
+
+When `helm upgrade` returns a non-zero exit code, the action captures — inside collapsible
+`::group::` blocks and before re-exiting with the original code:
+
+- `kubectl describe deploy` for matching deployments
+- The last 100 events in the namespace (sorted by `.lastTimestamp`)
+- For each not-ready container across matching pods: both `kubectl logs --previous` and
+  `kubectl logs --tail=200`
+
+This means failures like "app boots, throws an exception, container crashloops" show up
+with the actual PHP/app error in the workflow log — no `kubectl` access required to
+diagnose.
+
+### 4. Real sealed-secrets wait
+
+`Apply Sealed Secrets` no longer sleeps for a fixed interval. Instead it enumerates the
+`SealedSecret` resources from the kustomization and polls the namespace (up to
+`sealed-secrets-timeout` seconds, default 60) until the target `Secret`s exist. On
+timeout, the step fails with a clear message listing which Secrets are still missing.
 
 ## Versioning
 

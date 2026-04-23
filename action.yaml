@@ -52,6 +52,19 @@ inputs:
     description: 'External database host (e.g., pr-123-mysql.biscred-db.svc.cluster.local). If set, DB_HOST values will be configured.'
     required: false
     default: ''
+  # Deploy reliability configuration
+  atomic:
+    description: |
+      Run `helm upgrade --install` with `--atomic --cleanup-on-fail`. When true (default),
+      a failed deploy rolls back automatically instead of leaving the release in a
+      `pending-upgrade` state that blocks subsequent runs. Set to 'false' per-run if you
+      need the crashed pods to remain in-cluster for kubectl inspection.
+    required: false
+    default: 'true'
+  sealed-secrets-timeout:
+    description: 'Seconds to wait for the sealed-secrets controller to materialize each target Secret after kubectl apply.'
+    required: false
+    default: '60'
   # Connection test configuration
   skip-connection-tests:
     description: 'Skip database and Redis connection tests'
@@ -123,72 +136,234 @@ runs:
         echo "role-arn=${ROLE_ARN}" >> $GITHUB_OUTPUT
         echo "Found IAM Role ARN: ${ROLE_ARN}"
 
-    - name: Apply Sealed Secrets
+    - name: Compute Release Name
+      id: release-name
       shell: bash
+      env:
+        PR_NUMBER: ${{ inputs.pr-number }}
+        APP_NAME_INPUT: ${{ inputs.app-name }}
       run: |
-        KUSTOMIZATION_PATH="${{ inputs.kustomization-path }}"
+        set -euo pipefail
 
-        if [ -f "${KUSTOMIZATION_PATH}/kustomization.yaml" ]; then
-          echo "Applying sealed secrets from ${KUSTOMIZATION_PATH}..."
-          kubectl apply -k "${KUSTOMIZATION_PATH}"
-
-          echo "Waiting for sealed-secrets controller to decrypt..."
-          sleep 10
-        else
-          echo "No kustomization.yaml found at ${KUSTOMIZATION_PATH}, skipping sealed secrets..."
-        fi
-
-    - name: Deploy PR Stack
-      shell: bash
-      run: |
-        echo "Deploying PR #${{ inputs.pr-number }} with image ${{ inputs.image-tag }}"
-
-        RELEASE_SUFFIX="-pr-${{ inputs.pr-number }}"
+        RELEASE_SUFFIX="-pr-${PR_NUMBER}"
         MAX_APP_LEN=$((53 - ${#RELEASE_SUFFIX}))
-        APP_NAME="${{ inputs.app-name }}"
+        APP_NAME="${APP_NAME_INPUT}"
 
-        if [ ${#APP_NAME} -gt $MAX_APP_LEN ]; then
+        if [ ${#APP_NAME} -gt "$MAX_APP_LEN" ]; then
           APP_NAME="${APP_NAME:0:$MAX_APP_LEN}"
           echo "Warning: app-name truncated to ${MAX_APP_LEN} chars to fit Helm 53-char release name limit: ${APP_NAME}"
         fi
 
         RELEASE_NAME="${APP_NAME}${RELEASE_SUFFIX}"
+        echo "release-name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
+        echo "Release name: ${RELEASE_NAME}"
 
-        # Build helm command with standard arguments
-        HELM_CMD="helm upgrade --install ${RELEASE_NAME} \
-          oci://${{ inputs.ecr-registry }}/laravel-pr-stack \
-          --version ${{ inputs.helm-chart-version }} \
-          --namespace ${{ inputs.namespace }} \
-          --values ${{ inputs.values-file-path }} \
-          --set global.prNumber=${{ inputs.pr-number }} \
-          --set serviceAccount.roleArn=${{ steps.get-role-arn.outputs.role-arn }}"
+    - name: Apply Sealed Secrets
+      shell: bash
+      env:
+        KUSTOMIZATION_PATH: ${{ inputs.kustomization-path }}
+        NAMESPACE: ${{ inputs.namespace }}
+        SEALED_SECRETS_TIMEOUT: ${{ inputs.sealed-secrets-timeout }}
+      run: |
+        set -euo pipefail
 
-        if [ -n "${{ inputs.image-tag }}" ]; then
-          HELM_CMD="$HELM_CMD --set image.tag=${{ inputs.image-tag }}"
+        if [ ! -f "${KUSTOMIZATION_PATH}/kustomization.yaml" ]; then
+          echo "No kustomization.yaml found at ${KUSTOMIZATION_PATH}, skipping sealed secrets..."
+          exit 0
         fi
 
-        # Add any extra --set overrides
-        if [ -n "${{ inputs.helm-set-values }}" ]; then
-          for kv in ${{ inputs.helm-set-values }}; do
-            HELM_CMD="$HELM_CMD --set $kv"
+        echo "Applying sealed secrets from ${KUSTOMIZATION_PATH}..."
+        kubectl apply -k "${KUSTOMIZATION_PATH}"
+
+        # Enumerate the target Secret names produced by SealedSecret resources in this kustomization.
+        # By default a SealedSecret creates a Secret with the same metadata.name; an override can be
+        # set via spec.template.metadata.name, which takes precedence when present.
+        TARGET_SECRETS=$(kubectl kustomize "${KUSTOMIZATION_PATH}" \
+          | yq eval-all 'select(.kind == "SealedSecret") | (.spec.template.metadata.name // .metadata.name)' -)
+
+        if [ -z "${TARGET_SECRETS}" ]; then
+          echo "No SealedSecret resources found in kustomization — nothing to wait for."
+          exit 0
+        fi
+
+        echo "Waiting up to ${SEALED_SECRETS_TIMEOUT}s for the sealed-secrets controller to materialize:"
+        # shellcheck disable=SC2001
+        echo "${TARGET_SECRETS}" | sed 's/^/  - /'
+
+        deadline=$(( $(date +%s) + SEALED_SECRETS_TIMEOUT ))
+        while :; do
+          missing=()
+          for name in ${TARGET_SECRETS}; do
+            if ! kubectl get secret -n "${NAMESPACE}" "${name}" >/dev/null 2>&1; then
+              missing+=("${name}")
+            fi
+          done
+
+          if [ ${#missing[@]} -eq 0 ]; then
+            echo "All sealed secrets decrypted."
+            break
+          fi
+
+          if [ "$(date +%s)" -ge "${deadline}" ]; then
+            echo "::error::Timed out after ${SEALED_SECRETS_TIMEOUT}s waiting for sealed-secrets controller."
+            echo "::error::Still missing: ${missing[*]}"
+            exit 1
+          fi
+
+          sleep 2
+        done
+
+    - name: Preflight - Recover Stuck Helm Release
+      shell: bash
+      env:
+        RELEASE_NAME: ${{ steps.release-name.outputs.release-name }}
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        # This step is best-effort: it must never fail the workflow on its own. Any unexpected
+        # error just logs and continues so the real deploy still runs (and surfaces the real error).
+        set +e
+
+        STATUS_JSON=$(helm status "${RELEASE_NAME}" -n "${NAMESPACE}" -o json 2>/dev/null)
+        if [ -z "${STATUS_JSON}" ]; then
+          echo "No existing release '${RELEASE_NAME}' in namespace '${NAMESPACE}' — nothing to unstick."
+          exit 0
+        fi
+
+        STATUS=$(echo "${STATUS_JSON}" | jq -r '.info.status // empty')
+        echo "Current release status: ${STATUS:-<unknown>}"
+
+        case "${STATUS}" in
+          pending-upgrade|pending-install|pending-rollback)
+            echo "::warning::Helm release ${RELEASE_NAME} is stuck in '${STATUS}' — attempting recovery."
+
+            LAST_DEPLOYED_REV=$(helm history "${RELEASE_NAME}" -n "${NAMESPACE}" -o json 2>/dev/null \
+              | jq -r '[.[] | select(.status=="deployed")] | sort_by(.revision) | last.revision // empty')
+
+            if [ -n "${LAST_DEPLOYED_REV}" ]; then
+              echo "Rolling back to last deployed revision ${LAST_DEPLOYED_REV}..."
+              if helm rollback "${RELEASE_NAME}" "${LAST_DEPLOYED_REV}" -n "${NAMESPACE}"; then
+                echo "Rollback succeeded."
+              else
+                echo "::warning::helm rollback failed — continuing; the real deploy will surface the error."
+              fi
+            else
+              echo "No prior deployed revision exists — removing pending-state release secrets."
+              for s in pending-upgrade pending-install pending-rollback; do
+                kubectl delete secret -n "${NAMESPACE}" \
+                  -l "owner=helm,name=${RELEASE_NAME},status=${s}" \
+                  --ignore-not-found=true \
+                  || echo "::warning::Failed to delete ${s} release secrets — continuing."
+              done
+            fi
+            ;;
+          "")
+            echo "Could not parse release status; skipping preflight recovery."
+            ;;
+          *)
+            echo "Status '${STATUS}' is not a pending state — no preflight action needed."
+            ;;
+        esac
+
+        exit 0
+
+    - name: Deploy PR Stack
+      shell: bash
+      env:
+        PR_NUMBER: ${{ inputs.pr-number }}
+        APP_NAME: ${{ inputs.app-name }}
+        IMAGE_TAG: ${{ inputs.image-tag }}
+        RELEASE_NAME: ${{ steps.release-name.outputs.release-name }}
+        NAMESPACE: ${{ inputs.namespace }}
+        ECR_REGISTRY: ${{ inputs.ecr-registry }}
+        HELM_CHART_VERSION: ${{ inputs.helm-chart-version }}
+        VALUES_FILE_PATH: ${{ inputs.values-file-path }}
+        ROLE_ARN: ${{ steps.get-role-arn.outputs.role-arn }}
+        HELM_SET_VALUES: ${{ inputs.helm-set-values }}
+        EXTERNAL_DATABASE_HOST: ${{ inputs.external-database-host }}
+        ATOMIC: ${{ inputs.atomic }}
+      run: |
+        set -euo pipefail
+
+        echo "Deploying PR #${PR_NUMBER} with image ${IMAGE_TAG}"
+
+        # Build the helm invocation as an argv array so values with spaces are safe
+        # and we don't need `eval`.
+        helm_args=(
+          upgrade --install "${RELEASE_NAME}"
+          "oci://${ECR_REGISTRY}/laravel-pr-stack"
+          --version "${HELM_CHART_VERSION}"
+          --namespace "${NAMESPACE}"
+          --values "${VALUES_FILE_PATH}"
+          --set "global.prNumber=${PR_NUMBER}"
+          --set "serviceAccount.roleArn=${ROLE_ARN}"
+        )
+
+        if [ -n "${IMAGE_TAG}" ]; then
+          helm_args+=(--set "image.tag=${IMAGE_TAG}")
+        fi
+
+        if [ -n "${HELM_SET_VALUES}" ]; then
+          # shellcheck disable=SC2086
+          for kv in ${HELM_SET_VALUES}; do
+            helm_args+=(--set "${kv}")
           done
         fi
 
-        # Add external database host configuration if provided
-        if [ -n "${{ inputs.external-database-host }}" ]; then
-          echo "External database enabled, host: ${{ inputs.external-database-host }}"
-          HELM_CMD="$HELM_CMD \
-            --set appConfig.data.DB_HOST=${{ inputs.external-database-host }} \
-            --set appConfig.data.DB_READ_HOST=${{ inputs.external-database-host }} \
-            --set appConfig.data.DB_WRITE_HOST=${{ inputs.external-database-host }} \
-            --set additionalContainersDbHost=${{ inputs.external-database-host }}"
+        if [ -n "${EXTERNAL_DATABASE_HOST}" ]; then
+          echo "External database enabled, host: ${EXTERNAL_DATABASE_HOST}"
+          helm_args+=(
+            --set "appConfig.data.DB_HOST=${EXTERNAL_DATABASE_HOST}"
+            --set "appConfig.data.DB_READ_HOST=${EXTERNAL_DATABASE_HOST}"
+            --set "appConfig.data.DB_WRITE_HOST=${EXTERNAL_DATABASE_HOST}"
+            --set "additionalContainersDbHost=${EXTERNAL_DATABASE_HOST}"
+          )
         fi
 
-        # Add wait and timeout
-        HELM_CMD="$HELM_CMD --wait --timeout 10m"
+        helm_args+=(--wait --timeout 10m)
 
-        # Execute
-        eval "$HELM_CMD"
+        if [ "${ATOMIC}" = "true" ]; then
+          # --atomic rolls back a failed upgrade automatically; --cleanup-on-fail removes
+          # resources created during the failed attempt. Together they prevent the release
+          # from being left in a `pending-upgrade` state that would block the next run.
+          helm_args+=(--atomic --cleanup-on-fail)
+        fi
+
+        dump_failure_diagnostics() {
+          echo "::group::kubectl describe deploy (pr-number=${PR_NUMBER},app=${APP_NAME})"
+          kubectl describe deploy -n "${NAMESPACE}" -l "pr-number=${PR_NUMBER},app=${APP_NAME}" || true
+          echo "::endgroup::"
+
+          echo "::group::Recent events in namespace ${NAMESPACE} (last 100)"
+          kubectl get events -n "${NAMESPACE}" --sort-by='.lastTimestamp' 2>/dev/null | tail -100 || true
+          echo "::endgroup::"
+
+          echo "::group::Logs from not-ready containers"
+          pods=$(kubectl get pod -n "${NAMESPACE}" \
+            -l "pr-number=${PR_NUMBER},app=${APP_NAME}" \
+            -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+          for pod in ${pods}; do
+            not_ready=$(kubectl get pod -n "${NAMESPACE}" "${pod}" \
+              -o jsonpath='{range .status.containerStatuses[?(@.ready==false)]}{.name}{"\n"}{end}' 2>/dev/null || true)
+            for container in ${not_ready}; do
+              echo "--- pod=${pod} container=${container} (previous) ---"
+              kubectl logs -n "${NAMESPACE}" "${pod}" -c "${container}" --previous --tail=200 2>&1 || true
+              echo "--- pod=${pod} container=${container} (current) ---"
+              kubectl logs -n "${NAMESPACE}" "${pod}" -c "${container}" --tail=200 2>&1 || true
+            done
+          done
+          echo "::endgroup::"
+        }
+
+        set +e
+        helm "${helm_args[@]}"
+        helm_exit=$?
+        set -e
+
+        if [ "${helm_exit}" -ne 0 ]; then
+          echo "::error::helm upgrade failed with exit code ${helm_exit} — dumping diagnostics before exiting."
+          dump_failure_diagnostics
+          exit "${helm_exit}"
+        fi
 
     - name: Get Deployed URL
       id: get-url
