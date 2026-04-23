@@ -178,8 +178,10 @@ runs:
         # Enumerate the target Secret names produced by SealedSecret resources in this kustomization.
         # By default a SealedSecret creates a Secret with the same metadata.name; an override can be
         # set via spec.template.metadata.name, which takes precedence when present.
+        # yq eval-all emits `---` between documents; strip them so the list contains only names.
         TARGET_SECRETS=$(kubectl kustomize "${KUSTOMIZATION_PATH}" \
-          | yq eval-all 'select(.kind == "SealedSecret") | (.spec.template.metadata.name // .metadata.name)' -)
+          | yq eval-all 'select(.kind == "SealedSecret") | (.spec.template.metadata.name // .metadata.name)' - \
+          | grep -v '^---$')
 
         if [ -z "${TARGET_SECRETS}" ]; then
           echo "No SealedSecret resources found in kustomization — nothing to wait for."
