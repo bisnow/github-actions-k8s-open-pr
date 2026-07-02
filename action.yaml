@@ -3,8 +3,13 @@ description: 'Deploys a Laravel PR stack to Kubernetes using Helm'
 
 inputs:
   pr-number:
-    description: 'Pull request number'
-    required: true
+    description: 'Pull request number. Used to post the deployment comment on the PR and, unless stack-id is set, as the stack identity. Omit for PR-independent dev stacks (pass stack-id instead).'
+    required: false
+    default: ''
+  stack-id:
+    description: 'Stable stack identity used in the release name, hostname, and pr-number label (e.g. a PR number like "123", or a dev-stack slug like "dev-authfix"). Defaults to pr-number when omitted, so existing PR-stack callers are unaffected.'
+    required: false
+    default: ''
   image-tag:
     description: 'Docker image tag to deploy. If omitted, uses the tag already set in the values file.'
     required: false
@@ -96,6 +101,41 @@ runs:
       with:
         ref: ${{ github.head_ref || github.ref_name }}
 
+    - name: Resolve stack identity
+      id: stack-id
+      shell: bash
+      env:
+        STACK_ID_INPUT: ${{ inputs.stack-id }}
+        PR_NUMBER_INPUT: ${{ inputs.pr-number }}
+      run: |
+        set -euo pipefail
+
+        # The stack identity drives the release name, hostname, and pr-number
+        # label. It defaults to the PR number so existing PR-stack callers are
+        # unchanged; dev stacks pass an explicit non-PR slug via stack-id.
+        STACK_ID="${STACK_ID_INPUT:-}"
+        if [ -z "${STACK_ID}" ]; then
+          STACK_ID="${PR_NUMBER_INPUT:-}"
+        fi
+        if [ -z "${STACK_ID}" ]; then
+          echo "ERROR: one of stack-id or pr-number must be provided."
+          exit 1
+        fi
+
+        # The identity flows into the release name and the pr-number label, so it
+        # must be a valid Kubernetes label value: [A-Za-z0-9._-], <=63 chars,
+        # start/end alphanumeric.
+        if ! printf '%s' "${STACK_ID}" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$'; then
+          echo "ERROR: stack identity '${STACK_ID}' is not a valid label value (allowed: alphanumerics, '.', '_', '-'; <=63 chars; must start and end alphanumeric)."
+          exit 1
+        fi
+
+        # Publish for later steps: $GITHUB_ENV so bash steps see $STACK_ID directly,
+        # plus an output for steps that prefer explicit env: wiring.
+        echo "STACK_ID=${STACK_ID}" >> "$GITHUB_ENV"
+        echo "stack-id=${STACK_ID}" >> "$GITHUB_OUTPUT"
+        echo "Resolved stack identity: ${STACK_ID}"
+
     - name: Assume role for AWS Account
       uses: bisnow/github-actions-assume-role-for-environment@main
       with:
@@ -140,12 +180,11 @@ runs:
       id: release-name
       shell: bash
       env:
-        PR_NUMBER: ${{ inputs.pr-number }}
         APP_NAME_INPUT: ${{ inputs.app-name }}
       run: |
         set -euo pipefail
 
-        RELEASE_SUFFIX="-pr-${PR_NUMBER}"
+        RELEASE_SUFFIX="-pr-${STACK_ID}"
         MAX_APP_LEN=$((53 - ${#RELEASE_SUFFIX}))
         APP_NAME="${APP_NAME_INPUT}"
 
@@ -271,7 +310,6 @@ runs:
     - name: Deploy PR Stack
       shell: bash
       env:
-        PR_NUMBER: ${{ inputs.pr-number }}
         APP_NAME: ${{ inputs.app-name }}
         IMAGE_TAG: ${{ inputs.image-tag }}
         RELEASE_NAME: ${{ steps.release-name.outputs.release-name }}
@@ -286,7 +324,7 @@ runs:
       run: |
         set -euo pipefail
 
-        echo "Deploying PR #${PR_NUMBER} with image ${IMAGE_TAG}"
+        echo "Deploying stack ${STACK_ID} with image ${IMAGE_TAG}"
 
         # Build the helm invocation as an argv array so values with spaces are safe
         # and we don't need `eval`.
@@ -296,7 +334,7 @@ runs:
           --version "${HELM_CHART_VERSION}"
           --namespace "${NAMESPACE}"
           --values "${VALUES_FILE_PATH}"
-          --set "global.prNumber=${PR_NUMBER}"
+          --set "global.prNumber=${STACK_ID}"
           --set "serviceAccount.roleArn=${ROLE_ARN}"
         )
 
@@ -331,8 +369,8 @@ runs:
         fi
 
         dump_failure_diagnostics() {
-          echo "::group::kubectl describe deploy (pr-number=${PR_NUMBER},app=${APP_NAME})"
-          kubectl describe deploy -n "${NAMESPACE}" -l "pr-number=${PR_NUMBER},app=${APP_NAME}" || true
+          echo "::group::kubectl describe deploy (pr-number=${STACK_ID},app=${APP_NAME})"
+          kubectl describe deploy -n "${NAMESPACE}" -l "pr-number=${STACK_ID},app=${APP_NAME}" || true
           echo "::endgroup::"
 
           echo "::group::Recent events in namespace ${NAMESPACE} (last 100)"
@@ -341,7 +379,7 @@ runs:
 
           echo "::group::Logs from not-ready containers"
           pods=$(kubectl get pod -n "${NAMESPACE}" \
-            -l "pr-number=${PR_NUMBER},app=${APP_NAME}" \
+            -l "pr-number=${STACK_ID},app=${APP_NAME}" \
             -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
           for pod in ${pods}; do
             not_ready=$(kubectl get pod -n "${NAMESPACE}" "${pod}" \
@@ -376,14 +414,14 @@ runs:
 
         # 1. Try standard Kubernetes Ingress (chart v1 / ALB)
         INGRESS_HOST=$(kubectl get ingress -n ${{ inputs.namespace }} \
-          -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }} \
+          -l pr-number=${STACK_ID},app=${{ inputs.app-name }} \
           -o jsonpath='{.items[0].spec.rules[0].host}' 2>/dev/null || true)
 
         # 2. Try Traefik IngressRoute CRD (chart v2)
         if [ -z "$INGRESS_HOST" ]; then
           echo "No standard Ingress found, checking Traefik IngressRoute..."
           INGRESSROUTE_MATCH=$(kubectl get ingressroute -n ${{ inputs.namespace }} \
-            -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }} \
+            -l pr-number=${STACK_ID},app=${{ inputs.app-name }} \
             -o jsonpath='{.items[0].spec.routes[0].match}' 2>/dev/null || true)
 
           if [ -n "$INGRESSROUTE_MATCH" ]; then
@@ -396,9 +434,9 @@ runs:
         # 3. Fall back to constructed URL based on naming convention
         URL_ESTIMATED=false
         if [ -z "$INGRESS_HOST" ]; then
-          echo "WARNING: Could not find Ingress or IngressRoute for app=${{ inputs.app-name }} PR #${{ inputs.pr-number }}"
+          echo "WARNING: Could not find Ingress or IngressRoute for app=${{ inputs.app-name }} stack ${STACK_ID}"
           echo "Falling back to estimated URL based on naming convention."
-          INGRESS_HOST="${{ inputs.app-name }}-pr-${{ inputs.pr-number }}.non-prod.bisnow.cloud"
+          INGRESS_HOST="${{ inputs.app-name }}-pr-${STACK_ID}.non-prod.bisnow.cloud"
           echo "Estimated URL (may not reflect actual routing): https://${INGRESS_HOST}"
           URL_ESTIMATED=true
         fi
@@ -412,7 +450,7 @@ runs:
       if: inputs.skip-connection-tests != 'true'
       shell: bash
       run: |
-        POD=$(kubectl get pod -n ${{ inputs.namespace }} -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }} -o jsonpath='{.items[0].metadata.name}')
+        POD=$(kubectl get pod -n ${{ inputs.namespace }} -l pr-number=${STACK_ID},app=${{ inputs.app-name }} -o jsonpath='{.items[0].metadata.name}')
 
         echo "Testing database connection..."
         kubectl exec -n ${{ inputs.namespace }} ${POD} -c web -- php artisan tinker --execute="
@@ -429,7 +467,7 @@ runs:
       if: inputs.skip-connection-tests != 'true' && inputs.skip-redis-test != 'true'
       shell: bash
       run: |
-        POD=$(kubectl get pod -n ${{ inputs.namespace }} -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }} -o jsonpath='{.items[0].metadata.name}')
+        POD=$(kubectl get pod -n ${{ inputs.namespace }} -l pr-number=${STACK_ID},app=${{ inputs.app-name }} -o jsonpath='{.items[0].metadata.name}')
 
         echo "Testing Redis connection..."
         kubectl exec -n ${{ inputs.namespace }} ${POD} -c web -- php artisan tinker --execute="
@@ -452,7 +490,8 @@ runs:
         private-key: ${{ inputs.private-key }}
 
     - name: Post PR Comment
-      if: steps.app-token.outputs.token != ''
+      # Only when we have a real PR to comment on — dev stacks pass no pr-number.
+      if: steps.app-token.outputs.token != '' && inputs.pr-number != ''
       uses: actions/github-script@v8
       with:
         github-token: ${{ steps.app-token.outputs.token }}
@@ -502,7 +541,7 @@ runs:
         echo "" >> $GITHUB_STEP_SUMMARY
         if [ "${{ steps.get-url.outputs.url-estimated }}" = "true" ]; then
           echo "> [!WARNING]" >> $GITHUB_STEP_SUMMARY
-          echo "> Could not find an Ingress or IngressRoute for **${{ inputs.app-name }}** PR #${{ inputs.pr-number }}. The URL below is estimated from the naming convention and may not be correct." >> $GITHUB_STEP_SUMMARY
+          echo "> Could not find an Ingress or IngressRoute for **${{ inputs.app-name }}** stack \`${STACK_ID}\`. The URL below is estimated from the naming convention and may not be correct." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
         fi
         echo "**URL:** ${{ steps.get-url.outputs.app-url }}" >> $GITHUB_STEP_SUMMARY
@@ -517,5 +556,5 @@ runs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "### Status" >> $GITHUB_STEP_SUMMARY
         echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-        kubectl get pod -n ${{ inputs.namespace }} -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }} >> $GITHUB_STEP_SUMMARY
+        kubectl get pod -n ${{ inputs.namespace }} -l pr-number=${STACK_ID},app=${{ inputs.app-name }} >> $GITHUB_STEP_SUMMARY
         echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
