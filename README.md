@@ -28,7 +28,8 @@ Deploys Laravel PR stacks to Kubernetes using Helm. Handles AWS authentication, 
 
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
-| `pr-number` | PR number | Yes | - |
+| `pr-number` | PR number. Used to post the deploy comment on the PR and, unless `stack-id` is set, as the stack identity. Omit for PR-independent dev stacks. | No | - |
+| `stack-id` | Stable stack identity used in the release name, hostname, and `pr-number` label (e.g. a PR number `123`, or a dev-stack slug `dev-authfix`). Defaults to `pr-number`; must be a valid k8s label value. | No | `pr-number` |
 | `image-tag` | Docker image tag | Yes | - |
 | `app-name` | Application name | Yes | - |
 | `cloudformation-stack-name` | CloudFormation stack name | Yes | - |
