@@ -446,11 +446,41 @@ runs:
         echo "url-estimated=${URL_ESTIMATED}" >> $GITHUB_OUTPUT
         echo "Deployed URL: ${APP_URL}"
 
+    - name: Find Ready Pod
+      id: ready-pod
+      if: inputs.skip-connection-tests != 'true'
+      shell: bash
+      run: |
+        # A just-finished rollout can leave the previous pod Terminating, and
+        # `.items[0]` can select it — `kubectl exec` then fails with
+        # "container not found". Pick the newest pod that is actually Ready,
+        # retrying while the rollout settles.
+        for i in $(seq 1 60); do
+          POD=$(kubectl get pod -n ${{ inputs.namespace }} \
+            -l pr-number=${STACK_ID},app=${{ inputs.app-name }} \
+            --sort-by=.metadata.creationTimestamp \
+            -o jsonpath='{range .items[*]}{.metadata.name} {.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
+            | awk '$2 == "True" { name = $1 } END { print name }')
+          if [ -n "${POD}" ]; then
+            break
+          fi
+          echo "No ready pod yet (attempt ${i}/60)..."
+          sleep 5
+        done
+
+        if [ -z "${POD}" ]; then
+          echo "::error::No ready ${{ inputs.app-name }} pod found for stack ${STACK_ID}"
+          exit 1
+        fi
+
+        echo "pod=${POD}" >> $GITHUB_OUTPUT
+        echo "Using pod ${POD}"
+
     - name: Test Database Connection
       if: inputs.skip-connection-tests != 'true'
       shell: bash
       run: |
-        POD=$(kubectl get pod -n ${{ inputs.namespace }} -l pr-number=${STACK_ID},app=${{ inputs.app-name }} -o jsonpath='{.items[0].metadata.name}')
+        POD=${{ steps.ready-pod.outputs.pod }}
 
         echo "Testing database connection..."
         kubectl exec -n ${{ inputs.namespace }} ${POD} -c web -- php artisan tinker --execute="
@@ -467,7 +497,7 @@ runs:
       if: inputs.skip-connection-tests != 'true' && inputs.skip-redis-test != 'true'
       shell: bash
       run: |
-        POD=$(kubectl get pod -n ${{ inputs.namespace }} -l pr-number=${STACK_ID},app=${{ inputs.app-name }} -o jsonpath='{.items[0].metadata.name}')
+        POD=${{ steps.ready-pod.outputs.pod }}
 
         echo "Testing Redis connection..."
         kubectl exec -n ${{ inputs.namespace }} ${POD} -c web -- php artisan tinker --execute="
