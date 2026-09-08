@@ -44,12 +44,19 @@ inputs:
     required: false
     default: '560285300220.dkr.ecr.us-east-1.amazonaws.com'
   kustomization-path:
-    description: 'Path to kustomization directory containing sealed secrets'
+    description: 'Path to kustomization directory containing sealed secrets. Empty to skip (the stack gets its secrets another way, e.g. ESO).'
     required: false
     default: '.k8s/pr'
   # Extra Helm --set overrides (space-separated, e.g. "externalDatabase.enabled=true mysql.enabled=false")
   helm-set-values:
     description: 'Additional Helm --set overrides to apply at deploy time (space-separated key=value pairs).'
+    required: false
+    default: ''
+  # Raw YAML overlay, applied as a second --values file after the base one. Use this for
+  # structures --set cannot express at dispatch time (sandbox-stack sidecars are the reason
+  # it exists: additionalContainers is a list of maps, not a scalar).
+  extra-values:
+    description: 'Raw YAML applied as an additional Helm values file, overlaid on top of values-file-path.'
     required: false
     default: ''
   # External database configuration
@@ -206,8 +213,12 @@ runs:
       run: |
         set -euo pipefail
 
-        if [ ! -f "${KUSTOMIZATION_PATH}/kustomization.yaml" ]; then
-          echo "No kustomization.yaml found at ${KUSTOMIZATION_PATH}, skipping sealed secrets..."
+        # An empty path is the explicit "this stack has no sealed secrets" signal.
+        # Sandbox stacks use it: their kustomization pins the PR-stack namespace, so
+        # applying it would seal into the wrong namespace and the wait below — which
+        # polls inputs.namespace — would time out. They get secrets from ESO instead.
+        if [ -z "${KUSTOMIZATION_PATH}" ] || [ ! -f "${KUSTOMIZATION_PATH}/kustomization.yaml" ]; then
+          echo "No sealed-secrets kustomization to apply, skipping..."
           exit 0
         fi
 
@@ -319,6 +330,7 @@ runs:
         VALUES_FILE_PATH: ${{ inputs.values-file-path }}
         ROLE_ARN: ${{ steps.get-role-arn.outputs.role-arn }}
         HELM_SET_VALUES: ${{ inputs.helm-set-values }}
+        EXTRA_VALUES: ${{ inputs.extra-values }}
         EXTERNAL_DATABASE_HOST: ${{ inputs.external-database-host }}
         ATOMIC: ${{ inputs.atomic }}
       run: |
@@ -353,6 +365,16 @@ runs:
 
         if [ -n "${IMAGE_TAG}" ]; then
           helm_args+=(--set "image.tag=${IMAGE_TAG}")
+        fi
+
+        # A second --values file merges over the first; --set still beats both,
+        # regardless of flag order.
+        if [ -n "${EXTRA_VALUES}" ]; then
+          EXTRA_VALUES_FILE="$(mktemp)"
+          printf '%s\n' "${EXTRA_VALUES}" > "${EXTRA_VALUES_FILE}"
+          echo "Applying extra values overlay:"
+          sed 's/^/  /' "${EXTRA_VALUES_FILE}"
+          helm_args+=(--values "${EXTRA_VALUES_FILE}")
         fi
 
         if [ -n "${HELM_SET_VALUES}" ]; then
