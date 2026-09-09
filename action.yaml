@@ -60,7 +60,7 @@ inputs:
   # Deploy reliability configuration
   atomic:
     description: |
-      Run `helm upgrade --install` with `--atomic --cleanup-on-fail`. When true (default),
+      Run `helm upgrade --install` with `--rollback-on-failure --cleanup-on-fail`. When true (default),
       a failed deploy rolls back automatically instead of leaving the release in a
       `pending-upgrade` state that blocks subsequent runs. Set to 'false' per-run if you
       need the crashed pods to remain in-cluster for kubectl inspection.
@@ -375,10 +375,11 @@ runs:
         helm_args+=(--wait --timeout 10m)
 
         if [ "${ATOMIC}" = "true" ]; then
-          # --atomic rolls back a failed upgrade automatically; --cleanup-on-fail removes
-          # resources created during the failed attempt. Together they prevent the release
-          # from being left in a `pending-upgrade` state that would block the next run.
-          helm_args+=(--atomic --cleanup-on-fail)
+          # Roll back a failed upgrade automatically; --cleanup-on-fail removes resources
+          # created during the failed attempt. Together they prevent the release from being
+          # left in a `pending-upgrade` state that would block the next run.
+          # --rollback-on-failure is the Helm 4 name for the old --atomic flag.
+          helm_args+=(--rollback-on-failure --cleanup-on-fail)
         fi
 
         dump_failure_diagnostics() {

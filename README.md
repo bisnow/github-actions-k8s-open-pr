@@ -39,7 +39,7 @@ Deploys Laravel PR stacks to Kubernetes using Helm. Handles AWS authentication, 
 | `helm-chart-version` | Helm chart version | No | `1.1.0` |
 | `values-file-path` | Helm values file path | No | `.k8s/overlays/pr/values.yaml` |
 | `ecr-registry` | ECR registry URL | No | `560285300220.dkr.ecr.us-east-1.amazonaws.com` |
-| `atomic` | Deploy with `helm --atomic --cleanup-on-fail`. See [Deploy reliability](#deploy-reliability) below. | No | `'true'` |
+| `atomic` | Deploy with `helm --rollback-on-failure --cleanup-on-fail`. See [Deploy reliability](#deploy-reliability) below. | No | `'true'` |
 | `sealed-secrets-timeout` | Seconds to wait for the sealed-secrets controller to materialize each target Secret. | No | `'60'` |
 
 ## Outputs
@@ -67,7 +67,7 @@ This action requires:
    target `Secret`s (bounded by `sealed-secrets-timeout`)
 6. Runs preflight recovery to unstick a previously wedged Helm release (see
    [Deploy reliability](#deploy-reliability))
-7. Deploys application using Helm with `--atomic --cleanup-on-fail` (unless `atomic: 'false'`),
+7. Deploys application using Helm with `--rollback-on-failure --cleanup-on-fail` (unless `atomic: 'false'`),
    dumping describe/events/logs on failure before exiting
 8. Resolves the deployed URL using a three-tier lookup:
    - **Standard Ingress** (chart v1 / ALB)
@@ -99,9 +99,9 @@ work, the real deploy step still runs and surfaces the underlying error.
 
 ### 2. Atomic deploys (default)
 
-With `atomic: 'true'` (default), the action passes `--atomic --cleanup-on-fail` to
-`helm upgrade --install`. A failed deploy is automatically rolled back and does **not**
-leave the release in a `pending-upgrade` state.
+With `atomic: 'true'` (default), the action passes `--rollback-on-failure --cleanup-on-fail`
+to `helm upgrade --install` (Helm 4 renamed the old `--atomic` flag). A failed deploy is
+automatically rolled back and does **not** leave the release in a `pending-upgrade` state.
 
 **Tradeoff:** atomic rollback also removes the broken pods, so you lose the in-cluster
 state useful for post-mortem `kubectl describe` / `kubectl logs` against a live pod.
