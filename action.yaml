@@ -132,7 +132,11 @@ runs:
         # The identity flows into the release name and the pr-number label, so it
         # must be a valid Kubernetes label value: [A-Za-z0-9._-], <=63 chars,
         # start/end alphanumeric.
-        if ! printf '%s' "${STACK_ID}" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$'; then
+        # [[ ]] not grep: grep anchors match per LINE, so a value like
+        # $'ok\nEVIL=1' passes (its first line matches) and the $GITHUB_ENV write
+        # below then injects an arbitrary variable into every later step — which
+        # run aws/kubectl/helm under an assumed role. [[ ]] anchors the whole string.
+        if ! [[ "${STACK_ID}" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$ ]]; then
           echo "ERROR: stack identity '${STACK_ID}' is not a valid label value (allowed: alphanumerics, '.', '_', '-'; <=63 chars; must start and end alphanumeric)."
           exit 1
         fi
