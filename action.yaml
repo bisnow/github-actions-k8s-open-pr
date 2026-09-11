@@ -346,10 +346,15 @@ runs:
         # the live Helm release, rather than a fresh tag that was never built.
         # Reads live release state — nothing is committed to the branch.
         if [ -z "${IMAGE_TAG}" ]; then
-          CURRENT_TAG=$(helm get values "${RELEASE_NAME}" -n "${NAMESPACE}" -o json 2>/dev/null | jq -r '.image.tag // empty')
+          # The `|| CURRENT_TAG=""` matters: with set -e and pipefail, a missing release (the
+          # first deploy of a stack) makes helm exit non-zero with stderr silenced, and the
+          # step used to die right here with no output at all.
+          CURRENT_TAG=$(helm get values "${RELEASE_NAME}" -n "${NAMESPACE}" -o json 2>/dev/null | jq -r '.image.tag // empty') || CURRENT_TAG=""
           if [ -n "${CURRENT_TAG}" ]; then
             IMAGE_TAG="${CURRENT_TAG}"
             echo "No new image built; reusing current release image tag: ${IMAGE_TAG}"
+          else
+            echo "No image-tag input and no existing release; using image.tag from ${VALUES_FILE_PATH}"
           fi
         fi
 
